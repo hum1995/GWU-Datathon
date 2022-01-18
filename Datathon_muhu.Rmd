@@ -1,0 +1,561 @@
+---
+title: "Datathon_muhu"
+author: "muhu"
+date: "1/16/2022"
+output: html_document
+---
+#Abstract  
+In this project, We wanted to find what characteristics of a tweet can lead to a retweet behavior. We defined our response variable: 'retweet_counts' into three categorical levels: low, medium and high. For predictors, We picked some continuous and categorical variables based on logical reasoning. We sampled a 10,000 datapoints out of the original dataset to be used as our corpus in this project. We first performed Natural Language Processing(NLP) for tweet text. We used the latent dirichlet allocation(LDA) model to generate 6 topics based on tokens and labeled each tweet by the 6 topics. We then fitted a statistical multinomial model to predict 'retweet_counts'. We also added interactions among categorical predictors to make model selections. For model performance evaluation, we used the confusion matrix and ROC/AUC metrics. The final statistical multinomial model had an accuracy rate of 61.45%. It had true positive rates for "retweet_counts = low, medium and high' 55.02%, 69.54% and 65.07% respectively. The AUC values for the three response category levels were 80.03%, 67.74% and 84.71% accordingly. For result interpretation, we found that original/retweet/quoted counts verified or not and tweet text on political slogan topic as well as micro policy(work, education, veterams and community service) played a key role in predicting retweet_counts.
+
+#Project Pipeline
+##Data Preprocessing
+```{r}
+setwd("C:/Users/Mu/Desktop/GWU Datathon")
+Tweet = read.csv(file="full_tweets.csv", header = TRUE)
+```
+
+```{r}
+summary(Tweet$retweet_count)
+plot(Tweet$retweet_count)
+Tweet[Tweet$retweet_count > 10000,]
+```
+There are some extreme values in 'retweet_count'. After taking a look at these datapoints, We found all these original retweets were from celebrities according to 'retweet_screen_name' and 'retweet_name'.  
+Based on the summary analysis of 'retweet_counts', we decided to categorize this feature into three levels: low(5 or less), medium(6-99), high(100 or more).
+
+**Create Response Variable**
+```{r}
+Tweet$response <- as.factor(ifelse(Tweet$retweet_count <= 5, "low",ifelse(Tweet$retweet_count >= 100,"high","medium")))
+```
+This project plans to predict retweet counts based on the content of the tweet('text'), the identity of the account('decription') and other characteristics of the account.
+
+**Subset**
+```{r}
+set.seed(123)
+index <- sample(1:nrow(Tweet),10000, replace = F)
+sample <- Tweet[index,]
+table(sample$response)
+```
+The reason we are taking a subset of the original full data is to reduce future model running time.
+
+**Create new features**
+```{r}
+library(dplyr)
+sample$other_followers_count <- with(sample,
+coalesce(retweet_followers_count, quoted_followers_count)) # combine 'retweet_followers_count' and 'quoted_followers_count' into 'other_followers_count'
+
+sample$other_verified <- with(sample,
+coalesce(retweet_verified, quoted_verified)) # combine 'retweet_verified' and 'quoted_verified' into 'other_verified'
+
+sample$other_friends_count <- with(sample,
+coalesce(retweet_friends_count, quoted_friends_count))# combine 'retweet_friends_count' and 'quoted_friends_count' into 'other_friends_count'
+
+sample$other_description <- with(sample,
+coalesce(retweet_description, quoted_description)) # combine 'quoted_description' and 'retweet_description' into 'other_description'
+
+sample$other_statuses_count <- with(sample,
+coalesce(retweet_statuses_count, quoted_statuses_count)) # combine 'quoted_statuses_count' and 'retweet_statuses_count' into 'other_statuses_count'
+```
+We combined several features into  new ones. For example, 'retweet_followers_count' and 'quoted_followers_count' were combined into a new 'other_followers_count' because for a single tweet datapoint, it would be either retweeted or quoted(When retweeted, the quoted count would be NA; when quoted, the retweeted count would be NA). We feel such two features can be more concise if being combined into a new one.
+
+**NLP for text data**
+```{r}
+library(rtweet)
+library(tidyr)
+library(tidytext)
+library(tm)
+library(ggplot2)
+```
+
+```{r}
+# stemming and lemmatization
+text_stripped1 <- gsub("http\\S+","",sample$text) # remove url
+#head(sample$text_stripped1)
+text_stripped2 <- gsub("\\@","",text_stripped1) # remove special characters
+#head(sample$text_stripped2)
+text_stripped3 <- gsub("&amp\\S+","",text_stripped2)
+#head(sample$text_stripped3)
+text_stripped4 <- gsub("[\r\n]","",text_stripped3)
+#head(sample$text_stripped4)  
+text_stripped5 <- gsub("[^a-zA-Z]"," ",text_stripped4) # keep only standard characters
+#head(text_stripped5)  
+sample$text_clean <- removeWords(tolower(text_stripped5), stopwords("english")) # remove stopwords
+head(sample$text_clean)
+```
+We cleaned up the 'text' in the above chunk.
+
+```{r}
+text_tokens <- sample %>%
+  select(status_id, text_clean) %>%
+  unnest_tokens(token, text_clean) %>%
+  # filter out single characters caused by text cleaning
+  filter(nchar(token)>1)
+
+# look at the distribution of token frequency  
+text_tokens %>% group_by(token) %>% summarize(token_freq = n()) %>%
+  mutate(token_freq_binned = case_when(token_freq>20~20,TRUE~as.numeric(token_freq))) %>% 
+  group_by(token_freq_binned) %>% summarise(n_tokens = n()) %>%  
+  mutate(pct_tokens = n_tokens/sum(n_tokens),
+         cumpct_tokens = cumsum(n_tokens)/sum(n_tokens)) %>% 
+  ggplot(aes(x=token_freq_binned)) + 
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+          geom_bar(aes(y=pct_tokens),stat='identity',fill='blue') +  
+          geom_line(aes(y=cumpct_tokens),stat='identity',color='orange',linetype='dashed') + 
+          geom_text(aes(y=cumpct_tokens,label=scales::percent(cumpct_tokens,accuracy=1)),
+                    size=3) + theme_minimal() + 
+          ggtitle("Frequency of token in Corpus (all tweets)") + xlab("token frequency") +
+          ylab("% of all tokens")
+```
+
+From the long-right-tailed distribution plot above, we can see percentage of token frequency in the dataset declined when token frequency increased. Token frequency with value one occupied around 51% of the total tokens, followed by around 14% of tokens appearing twice. Tokens appearing 20 times or more occupied around 8% of all tokens.
+```{r}
+text_tokens %>% 
+  group_by(token) %>% summarize(token_freq=n()) %>% 
+  mutate(min_5_freq = case_when(token_freq<5~'token frequency: <5',
+                                TRUE~'token frequency: >=5')) %>% 
+  group_by(min_5_freq) %>% summarise(n_unique_tokens = n(),n_tokens=sum(token_freq)) %>% 
+  mutate(pct_unique_tokens = scales::percent(n_unique_tokens / sum(n_unique_tokens)),
+         pct_all_tokens=scales::percent(n_tokens / sum(n_tokens))) 
+
+# remove infrequent tokens(token frequency < 5)
+text_tokens_sub <- text_tokens %>%
+  group_by(token) %>% mutate(token_freq = n()) %>% filter(token_freq >= 5)
+# create document term matrix
+dtm_text <- text_tokens_sub %>% 
+  cast_dtm(document = status_id,term = token,value = token_freq)
+#check dimensions of dtm_text
+cat(paste0('DTM dimensions: Documents (',dim(dtm_text)[1],') x Tokens (',dim(dtm_text)[2],')',
+           ' (average token frequency: ',round(sum(dtm_text)/sum(dtm_text!=0),2),')'))
+```
+Token frequencies less than 5 occupied only 14% of all tokens. By filering out these infrequent tokens, we could reduce the potential impact of these noise. The selected tokens(frequency >=5) still occupied 86% of all the tokens.  
+We wanted to use the Latent Dirichlet Allocation(LDA) algorithm to fit a topic model. In order to do that, we first needed to convert the corpus into a document term matrix(dtm). The dtm after conversion had 9910 rows and 4832 columns.
+
+```{r}
+# fit latent dirichlet allocation(LDA) model and use 10 topics as the starting point
+library(topicmodels)
+library(LDAvis)
+lda_text1 <- LDA(dtm_text, k = 10)
+```
+
+```{r}
+# evaluate the model
+phi1 <- posterior(lda_text1)$terms %>% as.matrix # phi1 = P(token|topic)
+theta1 <- posterior(lda_text1)$topics %>% as.matrix # theta1 = P(topic|tweet)
+theta1[1:5,]
+```
+
+```{r}
+# number of tokens per tweet
+doc_length <- text_tokens_sub %>% group_by(status_id) %>% 
+  summarize(doc_length=n()) %>% select(doc_length) %>% pull() 
+# vocabulary: unique tokens
+vocab1 <- colnames(phi1) 
+
+# overall token frequency
+term_frequency1 <- text_tokens_sub %>% group_by(token) %>% 
+  summarise(n=n()) %>% arrange(match(token, vocab1)) %>% select(n) %>% pull() 
+
+
+# create JSON containing all needed elements
+library(tsne)
+svd_tsne <- function(x) tsne(svd(x)$u)
+json_text1 <- createJSON(phi1, theta1, doc_length, vocab1, term_frequency1, mds.method = svd_tsne,)
+serVis(json_text1)
+```
+
+Token "today" and "will" seemed too frequently showing up but didn't help with interpreting the topic, thus filtering them out. 
+```{r}
+text_tokens_sub2 <- text_tokens_sub %>% 
+  filter(!token %in% c('today', 'will'))
+dtm_text2 <- text_tokens_sub2 %>% 
+  cast_dtm(document = status_id,term = token,value = token_freq)
+cat(paste0('DTM dimensions: Documents (',dim(dtm_text2)[1],') x Tokens (',dim(dtm_text2)[2],')',
+           ' (average token frequency: ',round(sum(dtm_text2)/sum(dtm_text2!=0),2),')'))
+lda_text2 <- LDA(dtm_text2, k = 10, control = list(nstart = 1, seed = 5678)) 
+
+phi2 <- posterior(lda_text2)$terms %>% as.matrix
+theta2 <- posterior(lda_text2)$topics %>% as.matrix
+theta2[1:5,]
+doc_length2 <- text_tokens_sub2 %>% group_by(status_id) %>% 
+  summarize(doc_length=n()) %>% select(doc_length) %>% pull() 
+vocab2 <- colnames(phi2) 
+term_frequency2 <- text_tokens_sub2 %>% group_by(token) %>% 
+  summarise(n=n()) %>% arrange(match(token, vocab2)) %>% select(n) %>% pull() 
+json_text2 <- createJSON(phi2, theta2, doc_length2, vocab2, term_frequency2, mds.method = svd_tsne,)
+serVis(json_text2)
+```
+
+Some topics seemed to overlap with each other and some contained only non-meaningful tokens. So we decided to try k = 6.
+```{r}
+lda_text3 <- LDA(dtm_text2, k = 6, control = list(nstart = 1, seed = 5678)) # reduce topic number to 6
+phi3 <- posterior(lda_text3)$terms %>% as.matrix
+theta3 <- posterior(lda_text3)$topics %>% as.matrix
+theta3[1:5,]
+vocab3 <- colnames(phi3) 
+term_frequency3 <- text_tokens_sub2 %>% group_by(token) %>% 
+  summarise(n=n()) %>% arrange(match(token, vocab3)) %>% select(n) %>% pull() 
+json_text3 <- createJSON(phi3, theta3, doc_length2, vocab3, term_frequency3, mds.method = svd_tsne,)
+serVis(json_text3)
+```
+interpretation of the outcome: The left hand side plot shows the size of topics (How many tweets are attributed to the topic?) as well as the distance between topics (What Topics are more/less related to each other?). The right hand side shows the important tokens for the selected topic (or the overall most important tokens in the topic model when no topic is selected). With the top-right slider we can change lambda, where lambda decides how much we favor looking at the absolute token probability within the topic (p(token|topic), lambda = 1) or prefer the relative token probability within the topic (p(token|topic)/p(token), lambda = 0).
+
+The outcome looked good with topic number equaling 6 and this specific seed. Next we tried to label the topics. All the six topics were political related, but differed in different aspects.   
+I named topic 1: macro policy(US bills, economy and infrastructure).  
+Topic 2: Micro policy(work, education,veterans and community service).  
+Topic 3: be grateful.  
+Topic 4: People and families.  
+Topic 5: Trump and Biden in Covid.  
+Topic 6: Political Slogans.
+
+```{r}
+saveRDS(lda_text3,'lda_text.RDS') # save the model for future reference
+# convert posterior topic probability per tweet to topic indicators and attach to original data
+text_threshold <- 1/6
+text_topicprob <- as.matrix(ifelse(theta3 >= text_threshold,1,0),nrow(theta3),6)
+text_topicprob <- cbind(rownames(text_topicprob),text_topicprob)
+colnames(text_topicprob) <- c("status_id",paste0("text_topic",colnames(text_topicprob)[2:7]))
+sample2 <- sample %>% left_join(as.data.frame(text_topicprob), by = ("status_id" = "status_id"))
+```
+
+Higher posterior probabilities indicated higher chances that certain tweet belonged to certain topic. The threshold we set was 1/6. That meant if the posterior probability of a tweet under a certain topic was larger than 1/6, the tweet belonged to that certain topic.  
+
+We finished the processing of tweet text above. Now we wanted to process the description of the account using the same measure.
+
+```{r}
+# clean up column "description"
+des_stripped1 <- gsub("http\\S+","",sample2$description)
+#head(sample$text_stripped1)
+des_stripped2 <- gsub("\\@","",des_stripped1)
+#head(sample$des_stripped2)
+des_stripped3 <- gsub("&amp\\S+","",des_stripped2)
+#head(sample$des_stripped3)
+des_stripped4 <- gsub("[\r\n]","",des_stripped3)
+#head(des_stripped4)  
+des_stripped5 <- gsub("[^a-zA-Z]"," ",des_stripped4)
+#head(des_stripped5) 
+sample2$des_clean <- removeWords(tolower(des_stripped5), stopwords("english"))
+head(sample2$des_clean)
+```
+
+```{r}
+des_tokens <- sample2 %>%
+  select(status_id, des_clean) %>%
+  unnest_tokens(token, des_clean) %>%
+  # filter out single characters caused by text cleaning
+  filter(nchar(token)>1)
+
+# look at distribution of token frequency  
+des_tokens %>% group_by(token) %>% summarize(token_freq = n()) %>%
+  mutate(token_freq_binned = case_when(token_freq>20~20,TRUE~as.numeric(token_freq))) %>% 
+  group_by(token_freq_binned) %>% summarise(n_tokens = n()) %>%  
+  mutate(pct_tokens = n_tokens/sum(n_tokens),
+         cumpct_tokens = cumsum(n_tokens)/sum(n_tokens)) %>% 
+  ggplot(aes(x=token_freq_binned)) + 
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1)) + 
+          geom_bar(aes(y=pct_tokens),stat='identity',fill='blue') +  
+          geom_line(aes(y=cumpct_tokens),stat='identity',color='orange',linetype='dashed') + 
+          geom_text(aes(y=cumpct_tokens,label=scales::percent(cumpct_tokens,accuracy=1)),
+                    size=3) + theme_minimal() + 
+          ggtitle("Frequency of token in Corpus (all descriptions)") + xlab("token frequency") +
+          ylab("% of all tokens")
+```
+
+We could see that most of the tokens were highly repeated in different tweets. Therefore, there was no need to remove infrequent tokens.
+
+```{r}
+des_tokens <- des_tokens %>%
+  group_by(token) %>%  mutate(token_freq = n())
+# create document term matrix
+dtm_des <- des_tokens %>% 
+  cast_dtm(document = status_id,term = token,value = token_freq)
+#check dimenstions of dtm_des
+cat(paste0('DTM dimensions: Documents (',dim(dtm_des)[1],') x Tokens (',dim(dtm_des)[2],')',
+           ' (average token frequency: ',round(sum(dtm_des)/sum(dtm_des!=0),2),')'))
+```
+
+```{r}
+lda_des1 <- LDA(dtm_des, k = 5, control = list(nstart = 1, seed = 5678))
+phi1 <- posterior(lda_des1)$terms %>% as.matrix
+theta1 <- posterior(lda_des1)$topics %>% as.matrix
+theta1[1:5,]
+doc_length <- des_tokens %>% group_by(status_id) %>% 
+  summarize(doc_length=n()) %>% select(doc_length) %>% pull() 
+vocab1 <- colnames(phi1) 
+term_frequency1 <- des_tokens %>% group_by(token) %>% 
+  summarise(n=n()) %>% arrange(match(token, vocab1)) %>% select(n) %>% pull() 
+json_des1 <- createJSON(phi1, theta1, doc_length, vocab1, term_frequency1, mds.method = svd_tsne,)
+serVis(json_des1)
+
+```
+At this point, we found there was no need to analyze 'description' because most of the high-frequency tokens had the same meanings('congressman', 'congresswoman', 'represent', 'district', 'senator', etc.)
+
+**Determine features**
+From our common sense and logical judgement, some features were picked out to help predict the response variable. They included continuous variables like "display_text_width","followers_count","friends_count","listed_count","statuses_count","other_followers_count","other_friends_count" and "other_statuses_count". And there were also some categorical variables like "verified","other_verified" and 6 text topic indicators.
+
+**Exploratory Data Analysis(EDA)**
+```{r}
+fdata <- sample2[,c("display_text_width","followers_count","friends_count","listed_count","statuses_count","other_followers_count","other_friends_count","other_statuses_count","verified","other_verified","text_topic1","text_topic2","text_topic3","text_topic4","text_topic5","text_topic6","response")]
+str(fdata)
+#check missing values
+apply(fdata, 2, function(x) sum(is.na(x)))
+
+#fill in missing values
+# fdata <- fdata %>% 
+#   mutate(other_verified = coalesce(other_verified, 2),
+#          text_topic1 = coalesce(text_topic1, '2'),
+#          text_topic2 = coalesce(text_topic2, '2'),
+#          text_topic3 = coalesce(text_topic3, '2'),
+#          text_topic4 = coalesce(text_topic4, '2'),
+#          text_topic5 = coalesce(text_topic5, '2'),
+#          text_topic6 = coalesce(text_topic6, '2'),
+#          other_followers_count = coalesce(other_followers_count, 0),
+#          other_friends_count = coalesce(other_friends_count, 0),
+#          other_statuses_count = coalesce(other_statuses_count, 0)
+#          )
+fdata <- fdata %>% 
+  mutate(other_verified = coalesce(other_verified, 2),
+         text_topic1 = coalesce(text_topic1, '0'), # decided to recode missing values to 0 to avoid issue that may come with small sample size
+         text_topic2 = coalesce(text_topic2, '0'),
+         text_topic3 = coalesce(text_topic3, '0'),
+         text_topic4 = coalesce(text_topic4, '0'),
+         text_topic5 = coalesce(text_topic5, '0'),
+         text_topic6 = coalesce(text_topic6, '0'),
+         other_followers_count = coalesce(other_followers_count, 0),
+         other_friends_count = coalesce(other_friends_count, 0),
+         other_statuses_count = coalesce(other_statuses_count, 0)
+         )
+
+#assign appropriate data type
+fdata$text_topic1 <- as.factor(fdata$text_topic1)
+fdata$text_topic2 <- as.factor(fdata$text_topic2)
+fdata$text_topic3 <- as.factor(fdata$text_topic3)
+fdata$text_topic4 <- as.factor(fdata$text_topic4)
+fdata$text_topic5 <- as.factor(fdata$text_topic5)
+fdata$text_topic6 <- as.factor(fdata$text_topic6)
+fdata$verified <- as.factor(ifelse(fdata$verified == TRUE, 1, ifelse(fdata$verified == F, 0, 2)))
+fdata$other_verified <- as.factor(fdata$other_verified)
+
+#re-check missing values
+apply(fdata, 2, function(x) sum(is.na(x)))
+```
+
+```{r}
+#histogram of continuous variables
+par(mfrow=c(1,2))
+hist(fdata$followers_count)
+hist(fdata$other_followers_count)
+hist(fdata$friends_count)
+hist(fdata$other_friends_count)
+hist(fdata$statuses_count)
+hist(fdata$other_statuses_count)
+hist(fdata$listed_count)
+hist(fdata$display_text_width)
+```
+
+From the plots above, we could tell from the heavy right tails that there existed some extreme values in all the continuous variables except 'display_text_width'.
+```{r}
+#correlation analysis among continuous variables
+cor(as.matrix(fdata[,1:8]))
+```
+Normally, correlation > 0.8 indicated high correlation. We could see 'followers_count' had high correlation with 'listed_count'. For statistical model, we may need to remove one. We decided to remove 'listed-count', as this was more difficult to interpret. 
+```{r}
+data <- fdata[,-4]
+```
+
+```{r}
+#re-check correlation
+library(RColorBrewer)
+library(GGally)
+corr_score <- cor(data[,1:7])
+heatmap(corr_score,scale="column",col=colorRampPalette(brewer.pal(8,"PiYG"))(18))
+legend(x="left",legend=c(0,0.2,0.4,0.6,0.8,1.0),cex=0.8,
+       fill=colorRampPalette(brewer.pal(8,"PiYG"))(6))
+```
+
+```{r}
+corr_score
+```
+
+From the correlation heatmap and correlation matrix above, we could conclude that multicollinearity would not be a further problem.
+```{r}
+#barplot of categorical variables
+par(mfrow=c(1,2))
+with(data, plot(response~verified,xlab='verified'))
+with(data, plot(response~other_verified,xlab='other_verified'))
+with(data, plot(response~text_topic1,xlab='text_topic1'))
+with(data, plot(response~text_topic2,xlab='text_topic2'))
+with(data, plot(response~text_topic3,xlab='text_topic3'))
+with(data, plot(response~text_topic4,xlab='text_topic4'))
+with(data, plot(response~text_topic5,xlab='text_topic5'))
+with(data, plot(response~text_topic6,xlab='text_topic6'))
+```
+
+From the plots above, we could tell the proportion of response value within each categorical feature level. For example, when the account of retweet/quoted tweet was verified(other_verified=1), the proportion of low retweet counts(response='low') was less than 50%. However, when the account of original tweet was verified(other_verified=2), the proportion of low retweet counts(response='low') was more than 50%, indicating there might be a relationship between 'response' and 'other_verified'.
+
+**Model fitting**
+```{r}
+library(VGAM)
+# relevel 'verified' and 'other_verified' so that the largest category became the reference level
+data$verified <- relevel(data$verified,"1")
+data$other_verified <- relevel(data$other_verified, "2")
+# move response = 'low' to the last level so that VGLM recognized this as the reference level
+data$response <- factor(data$response, levels = c("medium","high","low"))
+
+# fit initial model
+model1 <- vglm(response ~ ., data = data, family = multinomial)
+summary(model1)
+```
+We decided to use statistical multinomial model for modeling due to the fact that the response variable had three categorical levels and there were not many predictors overall.   
+Normally we wanted the largest categorical level to be the reference level,and the R language defaultly set the first categorical level as the reference level. That was why we releveled the 'verified' and the 'other_verified' predictors. For text topics, value zero was the largest among all six topics, so there was no need to further adjust the reference level. For the response variable, the original default reference level was 'high'(first due to alphabetical order). Because VGAM package used the last level in response variable to be the reference level, we adjusted the position of 'low' to the last.   
+From the summary annalysis of 'model1', we could find the majority of the coefficients were significant under 5% significance level. For those insignificant coefficients(under 5% level), they matched with our initial findings in the EDA. For example, topic 1 was not significant in the summary analysis. Also in the EDA barplots, the proportion of different response levels stayed similar no matter the tweet belonged to topic 1 or not. Both findings suggested topic 1(macro policy) did not have a strong influence on the retweet_count. 
+
+```{r}
+# evaluate goodness of fit
+model_null <- vglm(response~1, data = data, family = multinomial)
+pchisq(deviance(model_null) - deviance(model1),df.residual(summary(model_null))-df.residual(summary(model1)),lower.tail = FALSE)
+```
+We compared model1 with a null model here.   
+H0: null model is better.  
+Ha: model1 is better.  
+Conclusion: Because p-value was zero, smaller than 5%, H0 was rejected under 5% significance level. model1 was better.
+
+```{r}
+# use stepwise selection 
+model_stepwise <- step4(model1, trace=0)
+summary(model_stepwise)
+pchisq(deviance(model_stepwise) - deviance(model1),df.residual(summary(model_stepwise))-df.residual(summary(model1)),lower.tail = FALSE) #select models
+```
+A stepwise method was used here to help select predictors. Then a model comparison between the stepwise model(reduced model) and model1(full model) was made.  
+H0: reduced model is better.  
+Ha: full model is better.  
+Conclusion: H0 cannot be rejected under 5% significance level. The stepwise model(reduced model) was better.  
+
+From the summary analysis of the stepwise model, we could see topic 5 was not significant. Some predictors originally in the full model(model1) had been removed by the stepwise method. 'Topic 1' was among them.
+```{r}
+#remove 'Topic 5'
+fmodel <- update(model_stepwise, .~.-text_topic5)
+summary(fmodel)
+pchisq(deviance(fmodel) - deviance(model_stepwise),df.residual(summary(fmodel))-df.residual(summary(model_stepwise)),lower.tail = FALSE) # select models
+```
+H0: the reduced model(fmodel) is better.  
+Ha: 'model_stepwise' is better.  
+Conclusion: Because p-vale > 0.05, H0 cannot be rejected at 5% significance level. 'fmodel' was better.  
+According to the summary analysis of the 'fmodel', there was no need to further remove predictors.  
+
+```{r}
+#model performance evaluation
+#confusion matrix
+index <- max.col(predictvglm(fmodel,type="response"))
+response_hat <- ifelse(index==1,"medium",ifelse(index==2,"high","low"))
+response_hat <- factor(response_hat, levels = c("medium","high","low"))
+table(response_hat,data$response)
+```
+In the confusion matrix table above, rows represented predicted response categories, while columns represented true response categories.  
+Accuracy rate = (2104+347+3694)/(10000)=61.45%;  
+True positive rate of medium: 2104/(2104+886+834) = 55.02%;  
+True positive rate of high: 347/(141+347+11) = 69.54%;  
+True positive rate of low: 3694/(3694+182+1801) = 65.07%.    
+The accuracy and TPR metrics looked okay. 
+
+```{r}
+#ROC/AUC
+require(pROC)
+par(pty = 's')
+prob <- predictvglm(fmodel,type="response")
+#response='low'
+  response_L <- factor(ifelse(data$response == 'low',1,0))
+  prob_L <- prob[,3]
+  roc(response_L, prob[,3], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+#response='medium'
+  response_L <- factor(ifelse(data$response == 'medium',1,0))
+  prob_L <- prob[,1]
+  roc(response_L, prob[,1], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+#response='high'
+  response_L <- factor(ifelse(data$response == 'high',1,0))
+  prob_L <- prob[,2]
+  roc(response_L, prob[,2], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+```
+
+The ROC plot was illustrated above. And the AUC value for response='low', 'medium' and 'high' were 80.03%, 67.74% and 84.71% respectively.
+So far for the evaluation of the 'fmodel'. However, we still wanted to see if adding interactions can boost the model performance further.
+
+```{r}
+#add interaction
+mod <- vglm(response~display_text_width + followers_count + 
+    friends_count + statuses_count + other_followers_count+ other_friends_count + 
+    other_statuses_count + verified + other_verified +  (text_topic1 + text_topic2 + 
+    text_topic3 + text_topic4 + text_topic5 + text_topic6)^2 , data = data, family = multinomial)
+summary(mod)
+pchisq(deviance(fmodel) - deviance(mod),df.residual(summary(fmodel))-df.residual(summary(mod)),lower.tail = FALSE)
+
+```
+First we tried to add interactions among continuous variables(Process not shown). The result was no good, so we switched to interactions among categorical variables which was shown above. Noticeably, those predictors that were formerly removed needed to be added back.  
+H0: the reduced model(fmodel) is better.  
+Ha: full model(mod) was better.
+Conclusion: H0 got rejected under 5% significance level. Full model(mod) was more favored.
+
+```{r}
+#stepwise variable selection
+model_stepwise2 <- step4(mod, trace = 0)
+summary(model_stepwise2)
+pchisq(deviance(model_stepwise2) - deviance(mod),df.residual(summary(model_stepwise2))-df.residual(summary(mod)),lower.tail = FALSE)
+pchisq(deviance(fmodel) - deviance(model_stepwise2),df.residual(summary(fmodel))-df.residual(summary(model_stepwise2)),lower.tail = FALSE)
+```
+Two model comparisons were made in the above chunk.  
+Conclusions: 'model_stepwise2' was more favored compared to 'mod'. And 'model_stepwise2' was also better compared with'fmodel', the model we intended to pick before adding interaction.
+
+```{r}
+#model evaluation
+index2 <- max.col(predictvglm(model_stepwise2,type="response"))
+response_hat2 <- ifelse(index2==1,"medium",ifelse(index2==2,"high","low"))
+response_hat2 <- factor(response_hat2, levels = c("medium","high","low"))
+table(response_hat2,data$response)
+```
+Accuracy rate = (2104+342+3720)/(10000)=61.70% > 61.45%;    
+True positive rate of medium: 2108/(2108+883+806) = 55.52% > 55.02%;  
+True positive rate of high: 342/(133+342+13) = 70.08% > 69.54%;  
+True positive rate of low: 3720/(3720+190+1805) = 65.09% > 65.07%.    
+
+```{r}
+#ROC/AUC
+par(pty = 's')
+prob <- predictvglm(model_stepwise2,type="response")
+#response='low'
+  response_L <- factor(ifelse(data$response == 'low',1,0))
+  prob_L <- prob[,3]
+  roc(response_L, prob[,3], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+#response='medium'
+  response_L <- factor(ifelse(data$response == 'medium',1,0))
+  prob_L <- prob[,1]
+  roc(response_L, prob[,1], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+#response='high'
+  response_L <- factor(ifelse(data$response == 'high',1,0))
+  prob_L <- prob[,2]
+  roc(response_L, prob[,2], plot=TRUE, legacy.axes = TRUE, percent=TRUE, xlab='FPR', ylab='TPR', col='#377eb8', lwd=4)
+```
+
+The ROC plot was illustrated above. And the AUC value for response='low', 'medium' and 'high' were 80.13%(>80.03%), 67.92%(>67.74%) and 84.82%(>84.71%) respectively.  
+We could see the modified model 'model_stepwise2' was slightly better in all metrics compared with 'fmodel'. This was also expected because statistically, at least one of the added interactions among categorical variables were significant at 5% significance level. And in common sense, tweets that only covered one topic was very likely to receive fewer retweet_counts than those covered in more topics. However, because the two models were still very close to the confusion matrix, and the fact that adding interactions made interpretation of the final results mode difficult, I would stick to use the 'fmodel' as my final model.  
+
+##Result Interpretation
+```{r}
+exp(coefficients(fmodel))
+```
+After taking an exponential transformation of the coefficients in the 'fmodel', we could find there were some relatively-large values of certain predictors like 'other_verified1:2'. A proper interpretation to this would be: while holding other covariates constant, compared to original posts(other_verified=2), if the retweet/quoted account was verified(other_verified=1), the odds of receiving high retweet_counts(the 2nd level of response) is 8.18 times the odds of receiving low retweet count(the reference level of response).  
+We could also see besides verified accounts, topic 6(political slogans) and topic2(micro policy) also played key role in affecting retweet_counts.
+
+#Recommendations and Next Steps
+Due to the lack of time, there were still interesting things that could be done but not realized in this project. I wanted to take on a brief discussion of the pros and cons of my work here.  
+
+**Pros:**  
+I adopted a statistical model rather than a machine learning model to predict 'retweet_counts', making interpretations of both models and results more reliable and reasonable.  
+I successfully used LDA algorithm to generate 6 topics out of the tweet text. The final result proved that the topics in tweet text played a key role in interpreting my response variable.  
+I kept some continuous varibales instead of categorizing all of them. This prevented potential harmful effects from data loss due to data preprocessing.  
+I didnot drop any missing values. This again prevented data loss to some extent in analysis.  
+
+**Cons:**  
+I only took 10,000 sample datapoints out of the original 1439130 datapoints. The result could be very biased due to random sampling. (But I had to do it, otherwise model running took forever.)   
+I could further tweak the LDA model for better topic analysis.  
+I did not consider predictors like 'location', 'screen_name' and 'hashtag'. Though I thought 'tweet text' should already contain the 'hashtag' information, the other two predictors did have some impacts to retweet_counts in initial common sense.  
+I did not have a chance to explore other classification models such as random forest, XGboost and K-means models. I could even try Lasso regression to select variables for me.  
+I could try other interesting response variables.  
+If the data provided information such as tweet sentiment"positive', 'neutral' and 'negative', I could further perform sentiment analysis based on the info.  
